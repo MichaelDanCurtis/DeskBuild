@@ -1,0 +1,7 @@
+{
+  "name": "lift_core",
+  "version": "1.0.0",
+  "description": "Hardware-independent motion, presence and crank logic for the rising knob panel",
+  "frameworks": "*",
+  "platforms": "*"
+}

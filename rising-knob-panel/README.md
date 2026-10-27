@@ -19,8 +19,8 @@ The carriage slides on two Ø4 mm steel rods in LM4UU linear bearings. Turning t
 - **Holds without power.** At each end the crank and link line up straight, so pushing on the knob loads the frame rather than the
   servo gears. Once it's parked you can stop sending the servo signal, and it stays put without buzzing.
 - **Forgiving at flush.** Near the ends, 5° of servo error moves the knob only about 0.03 mm.
-- **One wire to the board.** The servo signal can come from a spare GPIO on the display's FPC, so no second
-  microcontroller is needed. The earlier chat found 5V, GND and GPIO38/39/40 on the FPC; check this against VIEWE's pinout.
+- **No second microcontroller.** The display's own ESP32-S3 drives the servo and reads the sensor through its FPC
+  connector: servo on GPIO40, sensor on GPIO39/44. See [`firmware/`](firmware/) for the code and wiring.
 
 ## Actuator options
 
@@ -34,10 +34,11 @@ You asked which actuator to use. The servo is the design that's modelled and cla
 | Micro linear servo (Actuonix PQ12-R / L12-R) | Good | Moderate | Mostly | $70–90 | 1 PWM pin | Self-contained, but pricey and slow |
 | Solenoid | ✗ snaps | Loud clack | — | — | — | Doesn't meet "gradual" |
 
-## Hand sensing (not modelled yet)
+## Hand sensing (sensor mount not modelled yet)
 
-- **Recommended:** a **VL53L1X** time-of-flight distance sensor on I²C. It looks through a small hole in the wood next to the knob and
-  reliably detects a hand at about 5–30 cm. Use hysteresis in firmware, for example rise at < 15 cm and fall after 2 s with nothing within 20 cm.
+- **Used by the firmware:** a **VL53L1X** time-of-flight distance sensor on I²C. It looks out through a hole in the wood next to the
+  knob and reliably detects a hand at about 5–30 cm. The [firmware](firmware/) raises the knob when a hand stays within 15 cm and lowers
+  it 2.5 s after nothing is within 25 cm.
 - **Invisible option:** a copper-foil pad glued behind the wood with an **MPR121** capacitive sensor. It senses a hand through the wood
   with no visible hole, but takes more tuning.
 
@@ -65,6 +66,8 @@ wood panel), coloured, for opening in Fusion.
 - 4× M3×16 screws (rear bridge to base)
 - 4× #4 × ½" flat-head wood screws, or glue
 - a 5 V 2 A supply and a 470–1000 µF capacitor across the servo power
+- a VL53L1X breakout and a small 3.3 V regulator for it (the FPC has no 3.3 V pin); see [firmware wiring](firmware/README.md#wiring)
+- a 10 kΩ resistor (servo signal pull-down)
 
 ### Assumptions to check before printing
 
