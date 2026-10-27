@@ -11,8 +11,8 @@ VL53L1X tof;
 }
 
 bool TofSensor::begin() {
+    // The Wire bus is started in setup(): the sensor shares it with the PCF8574.
     if (!busStarted_) {
-        Wire.begin(config::kTofSdaPin, config::kTofSclPin, config::kTofI2cHz);
         tof.setBus(&Wire);
         tof.setTimeout(100);
         busStarted_ = true;
