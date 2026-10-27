@@ -1,18 +1,18 @@
 #pragma once
 
-// Knob positions, in mm of carriage travel measured from where the home sensor trips.
+// Knob positions, as the PQ12 actuator's extension in mm (0 = fully retracted).
 
 struct LiftSettings {
-    float flushMm = 1.0f;    // knob face level with the wood
+    float flushMm = 3.0f;    // extension that puts the knob face level with the wood
     float heightMm = 12.0f;  // how far it rises above flush
     float raisedMm() const { return flushMm + heightMm; }
 };
 
 struct LiftLimits {
-    float minFlushMm = 0.3f;   // keep the sensor clear while parked flush
-    float maxFlushMm = 4.0f;
+    float minFlushMm = 1.5f;    // keep the rod-end bracket off the actuator body
+    float maxFlushMm = 8.0f;
     float minHeightMm = 2.0f;
-    float maxTravelMm = 16.0f;  // short of the front hard stop
+    float maxTravelMm = 18.0f;  // short of the front hard stop (extension 19 mm)
 };
 
 inline LiftSettings clampSettings(LiftSettings s, const LiftLimits& l) {

@@ -4,7 +4,7 @@
 #include <cmath>
 
 #include "align.h"
-#include "homing.h"
+#include "motion.h"
 #include "lift_settings.h"
 #include "presence.h"
 #include "press.h"
@@ -25,90 +25,94 @@ void test_settings_clamp() {
     TEST_ASSERT_TRUE(s.raisedMm() <= l.maxTravelMm);
 }
 
-// ---------- homing ----------
+// ---------- motion ----------
 
-// A carriage on a lead screw with a normally-closed home switch at true position 0.
-// The controller only sees `positionMm()`, which starts out wrong by `offset`.
-struct FakeMotor : MotorPort {
-    float truePos;
-    float offset;  // reported = true + offset
-    float target;
-    float speed = 0.0f;
-    float accel = 1.0f;
-    bool switchBroken = false;  // reads "released" forever
-    bool switchStuck = false;   // reads "pressed" forever
-    float travelled = 0.0f;
+constexpr float kDt = 0.01f;
+constexpr MotionPlanner::Limits kRaise{9.0f, 18.0f};  // mm/s, mm/s^2 (the firmware defaults)
+constexpr MotionPlanner::Limits kLower{6.0f, 12.0f};
 
-    FakeMotor(float startTrue, float startReported) : truePos(startTrue), offset(startReported - startTrue), target(startReported) {}
-
-    float positionMm() override { return truePos + offset; }
-    bool moving() override { return std::fabs(target - positionMm()) > 1e-6f; }
-    void moveToMm(float mm, float s, float a) override { target = mm; speed = s; accel = a; }
-    void stop() override {
-        // Decelerating from `speed` overshoots by v^2 / 2a in the direction of travel.
-        const float dir = target > positionMm() ? 1.0f : -1.0f;
-        if (moving()) target = positionMm() + dir * speed * speed / (2.0f * accel);
+// Runs the planner, checking the speed and acceleration limits on every step.
+// Returns the time taken to settle on the target.
+float runChecked(MotionPlanner& m, MotionPlanner::Limits lim, float maxSeconds = 10.0f) {
+    float t = 0.0f;
+    float prevVel = m.velocity();
+    const float lo = std::fmin(m.position(), m.target()) - 0.05f;
+    const float hi = std::fmax(m.position(), m.target()) + 0.05f;
+    while (!m.atTarget() && t < maxSeconds) {
+        m.update(kDt);
+        t += kDt;
+        TEST_ASSERT_TRUE(std::fabs(m.velocity()) <= lim.maxVel + 1e-3f);
+        TEST_ASSERT_TRUE(std::fabs(m.velocity() - prevVel) <= lim.maxAccel * kDt + 1e-3f);
+        TEST_ASSERT_TRUE(m.position() >= lo && m.position() <= hi);  // no overshoot
+        prevVel = m.velocity();
     }
-    void setPositionMm(float mm) override {
-        offset = mm - truePos;
-        target = mm;
-    }
-    bool switchPressed() const {
-        if (switchBroken) return false;
-        if (switchStuck) return true;
-        return truePos <= 0.0f;
-    }
-    void step(float dt) {
-        const float d = target - positionMm();
-        const float s = std::fmin(std::fabs(d), speed * dt);
-        const float move = d > 0 ? s : -s;
-        truePos += move;
-        travelled += std::fabs(move);
-    }
-};
-
-Homing::State runHoming(Homing& h, FakeMotor& m, int maxTicks = 20000) {
-    h.start(m, m.switchPressed());
-    for (int i = 0; i < maxTicks && h.busy(); i++) {
-        m.step(0.01f);
-        h.update(m, m.switchPressed());
-    }
-    return h.state();
+    return t;
 }
 
-void test_homing_from_above_finds_trip_point() {
-    FakeMotor m(7.3f, 0.0f);  // really 7.3 mm above the switch, but the firmware thinks 0
-    Homing h;
-    TEST_ASSERT_EQUAL(static_cast<int>(Homing::State::Done), static_cast<int>(runHoming(h, m)));
-    TEST_ASSERT_FLOAT_WITHIN(0.01f, m.truePos, m.positionMm());
-    // It stops a hair past the trip point (switch still pressed); the firmware then moves to flush.
-    TEST_ASSERT_TRUE(m.switchPressed());
-    TEST_ASSERT_TRUE(m.positionMm() > -0.05f);
+void test_motion_raise_time_and_limits() {
+    MotionPlanner m(3.0f);
+    m.setTarget(15.0f, kRaise);
+    const float t = runChecked(m, kRaise);
+    // Trapezoid: 0.5 s ramp up, 12 mm - 4.5 mm at 9 mm/s, 0.5 s ramp down = 1.83 s.
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 1.833f, t);
+    TEST_ASSERT_EQUAL_FLOAT(15.0f, m.position());
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, m.velocity());
 }
 
-void test_homing_starting_on_the_switch() {
-    FakeMotor m(-0.6f, 5.0f);
-    Homing h;
-    TEST_ASSERT_EQUAL(static_cast<int>(Homing::State::Done), static_cast<int>(runHoming(h, m)));
-    TEST_ASSERT_FLOAT_WITHIN(0.01f, m.truePos, m.positionMm());
+void test_motion_short_move_never_reaches_cruise() {
+    MotionPlanner m(3.0f);
+    m.setTarget(3.5f, kRaise);
+    const float t = runChecked(m, kRaise);
+    TEST_ASSERT_FLOAT_WITHIN(0.03f, 2.0f * std::sqrt(0.5f / 18.0f), t);  // triangle profile
 }
 
-void test_homing_fails_safe_when_switch_never_trips() {
-    FakeMotor m(5.0f, 0.0f);
-    m.switchBroken = true;
-    Homing::Config c;
-    Homing h(c);
-    TEST_ASSERT_EQUAL(static_cast<int>(Homing::State::Failed), static_cast<int>(runHoming(h, m)));
-    TEST_ASSERT_TRUE(m.travelled <= c.maxSeekMm + 0.5f);
+void test_motion_reversal_is_smooth() {
+    MotionPlanner m(15.0f);
+    m.setTarget(3.0f, kLower);
+    for (int i = 0; i < 80; i++) m.update(kDt);  // sinking at full speed
+    TEST_ASSERT_TRUE(m.velocity() < -5.0f);
+
+    // Hand comes back: rise again. Velocity must stay continuous through the turnaround.
+    m.setTarget(15.0f, kRaise);
+    float prevVel = m.velocity();
+    float lowest = m.position();
+    for (int i = 0; i < 1000 && !m.atTarget(); i++) {
+        m.update(kDt);
+        TEST_ASSERT_TRUE(std::fabs(m.velocity() - prevVel) <= kRaise.maxAccel * kDt + 1e-3f);
+        prevVel = m.velocity();
+        lowest = std::fmin(lowest, m.position());
+    }
+    TEST_ASSERT_TRUE(m.atTarget());
+    TEST_ASSERT_EQUAL_FLOAT(15.0f, m.position());
+    TEST_ASSERT_TRUE(lowest > 3.0f);  // braked before reaching flush
 }
 
-void test_homing_fails_safe_when_switch_stuck() {
-    FakeMotor m(5.0f, 0.0f);
-    m.switchStuck = true;
-    Homing::Config c;
-    Homing h(c);
-    TEST_ASSERT_EQUAL(static_cast<int>(Homing::State::Failed), static_cast<int>(runHoming(h, m)));
-    TEST_ASSERT_TRUE(m.travelled <= c.releaseMm + 0.01f);  // only the release move
+void test_motion_target_inside_braking_distance() {
+    MotionPlanner m(3.0f);
+    m.setTarget(15.0f, kRaise);
+    for (int i = 0; i < 60; i++) m.update(kDt);  // cruising
+    const float target = m.position() + 0.5f;   // can't stop in 0.5 mm at 9 mm/s
+    m.setTarget(target, kRaise);
+    float prevVel = m.velocity();
+    float highest = m.position();
+    for (int i = 0; i < 1000 && !m.atTarget(); i++) {
+        m.update(kDt);
+        TEST_ASSERT_TRUE(std::fabs(m.velocity() - prevVel) <= kRaise.maxAccel * kDt + 1e-3f);
+        prevVel = m.velocity();
+        highest = std::fmax(highest, m.position());
+    }
+    TEST_ASSERT_TRUE(m.atTarget());
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, target, m.position());
+    TEST_ASSERT_TRUE(highest > target);  // braked past it and came back, without a jump
+}
+
+void test_motion_handles_irregular_ticks() {
+    MotionPlanner m(3.0f);
+    m.setTarget(15.0f, kRaise);
+    const float steps[] = {0.004f, 0.02f, 0.011f, 0.035f, 0.009f};
+    for (int i = 0; i < 2000 && !m.atTarget(); i++) m.update(steps[i % 5]);
+    TEST_ASSERT_TRUE(m.atTarget());
+    TEST_ASSERT_EQUAL_FLOAT(15.0f, m.position());
 }
 
 // ---------- align ----------
@@ -123,7 +127,7 @@ AlignSession::Config alignCfg() {
 
 LiftSettings startSettings() {
     LiftSettings s;
-    s.flushMm = 1.0f;
+    s.flushMm = 3.0f;
     s.heightMm = 12.0f;
     return s;
 }
@@ -132,10 +136,10 @@ void test_align_starts_by_showing_flush_then_lifts() {
     AlignSession a(alignCfg());
     a.begin(0, startSettings());
     TEST_ASSERT_TRUE(a.showingFlush());
-    TEST_ASSERT_EQUAL_FLOAT(1.0f, a.targetMm());
+    TEST_ASSERT_EQUAL_FLOAT(3.0f, a.targetMm());
     a.update(3000);
     TEST_ASSERT_FALSE(a.showingFlush());
-    TEST_ASSERT_EQUAL_FLOAT(13.0f, a.targetMm());
+    TEST_ASSERT_EQUAL_FLOAT(15.0f, a.targetMm());
 }
 
 void test_align_ring_adjusts_flush_with_preview() {
@@ -143,13 +147,13 @@ void test_align_ring_adjusts_flush_with_preview() {
     a.begin(0, startSettings());
     a.update(3000);
     a.adjust(4000, 3, AlignSession::Source::Ring);  // +0.15 mm
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.15f, a.settings().flushMm);
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 13.15f, a.targetMm());  // up, so the ring can turn
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 3.15f, a.settings().flushMm);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 15.15f, a.targetMm());  // up, so the ring can turn
     a.update(4900);
     TEST_ASSERT_FALSE(a.showingFlush());
     a.update(5000);
     TEST_ASSERT_TRUE(a.showingFlush());  // drops to the new flush to preview it
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.15f, a.targetMm());
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 3.15f, a.targetMm());
     a.update(8000);
     TEST_ASSERT_FALSE(a.showingFlush());  // and comes back up
 }
@@ -161,7 +165,7 @@ void test_align_console_nudge_stays_flush() {
     a.update(100000);
     TEST_ASSERT_EQUAL(static_cast<int>(AlignSession::Phase::Flush), static_cast<int>(a.phase()));
     TEST_ASSERT_TRUE(a.showingFlush());
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.9f, a.targetMm());
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 2.9f, a.targetMm());
 }
 
 void test_align_height_is_live_and_saves() {
@@ -170,12 +174,12 @@ void test_align_height_is_live_and_saves() {
     a.next(100);
     TEST_ASSERT_EQUAL(static_cast<int>(AlignSession::Phase::Height), static_cast<int>(a.phase()));
     a.adjust(200, -5, AlignSession::Source::Ring);  // -0.5 mm
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 12.5f, a.targetMm());
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 14.5f, a.targetMm());
     a.next(300);
     LiftSettings out;
     TEST_ASSERT_TRUE(a.takeFinished(out));
     TEST_ASSERT_FALSE(a.takeFinished(out));
-    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 1.0f, out.flushMm);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 3.0f, out.flushMm);
     TEST_ASSERT_FLOAT_WITHIN(1e-5f, 11.5f, out.heightMm);
 }
 
@@ -332,10 +336,11 @@ void test_presence_survives_millis_wraparound() {
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_settings_clamp);
-    RUN_TEST(test_homing_from_above_finds_trip_point);
-    RUN_TEST(test_homing_starting_on_the_switch);
-    RUN_TEST(test_homing_fails_safe_when_switch_never_trips);
-    RUN_TEST(test_homing_fails_safe_when_switch_stuck);
+    RUN_TEST(test_motion_raise_time_and_limits);
+    RUN_TEST(test_motion_short_move_never_reaches_cruise);
+    RUN_TEST(test_motion_reversal_is_smooth);
+    RUN_TEST(test_motion_target_inside_braking_distance);
+    RUN_TEST(test_motion_handles_irregular_ticks);
     RUN_TEST(test_align_starts_by_showing_flush_then_lifts);
     RUN_TEST(test_align_ring_adjusts_flush_with_preview);
     RUN_TEST(test_align_console_nudge_stays_flush);

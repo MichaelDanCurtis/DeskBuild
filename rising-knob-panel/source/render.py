@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw
 
 import rising_knob as rk
 
-UNCLIPPED = ("Lead screw", "Rod L", "Rod R", "Motor NEMA17")
+UNCLIPPED = ("Rod L", "Rod R")
 
 
 def actors(h, clip=None, hide=()):
@@ -25,7 +25,7 @@ def actors(h, clip=None, hide=()):
         a.SetMapper(mapper)
         p = a.GetProperty()
         p.SetColor(*rk.COLORS[key])
-        p.SetSpecular(0.3 if key in ("steel", "knob", "glass", "brass") else 0.1)
+        p.SetSpecular(0.3 if key in ("steel", "knob", "glass") else 0.1)
         p.SetSpecularPower(30)
         out.append(a)
     return out
@@ -69,8 +69,8 @@ if __name__ == "__main__":
     out = sys.argv[1]
     up = (0, 1, 0)
     front_eye, front_tgt = (170, 120, 260), (0, -5, -10)
-    back_eye, back_tgt = (-230, -170, -330), (-5, -12, -60)
-    side_eye, side_tgt = (330, 40, -50), (0, -15, -55)
+    back_eye, back_tgt = (-210, -160, -300), (-5, -10, -55)
+    side_eye, side_tgt = (300, 30, -45), (0, -12, -50)
     clip = ((0, 0, 0), (-1, 0, 0))
     shots = [
         ("1_front_flush.png", 0.0, front_eye, front_tgt, None, (), "Flush: knob face level with the wood"),

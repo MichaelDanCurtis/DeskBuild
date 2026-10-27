@@ -1,9 +1,10 @@
 // Rising knob panel: the knob display glides out of the wood when a hand comes
-// near and sinks flush again when it leaves.
+// near and sinks flush again when it leaves. An Actuonix PQ12-R linear actuator
+// moves it; it positions itself from an RC-servo pulse, so there is no homing.
 //
 // Two tasks:
-//   control (100 Hz, core 0): home sensor, distance sensor, presence, alignment,
-//                             stepper, knob ring, button and the USB console.
+//   control (100 Hz, core 0): distance sensor, presence, alignment, the motion
+//                             ramp to the actuator, knob ring, button, USB console.
 //   loop()  (core 1):         LVGL UI and display brightness.
 // They share only `shared` (under a spinlock) and the detent counter.
 
@@ -18,13 +19,12 @@
 
 #include "align.h"
 #include "config.h"
-#include "homing.h"
-#include "io_expander.h"
 #include "knob_encoder.h"
 #include "lift_settings.h"
+#include "motion.h"
 #include "presence.h"
 #include "press.h"
-#include "stepper_drive.h"
+#include "servo_ledc.h"
 #include "tof_sensor.h"
 #if RK_ENABLE_DISPLAY
 #include "display.h"
@@ -33,8 +33,10 @@
 
 namespace {
 
-enum class Sys : uint8_t { Homing, Run, Fault };
 enum class Mode : uint8_t { Auto, ForceUp, ForceDown };
+
+constexpr MotionPlanner::Limits kRaiseLimits{config::kRaiseSpeed, config::kRaiseAccel};
+constexpr MotionPlanner::Limits kLowerLimits{config::kLowerSpeed, config::kLowerAccel};
 
 PresenceDetector::Config presenceConfig() {
     PresenceDetector::Config c;
@@ -53,38 +55,28 @@ LiftLimits liftLimits() {
     return l;
 }
 
-Homing::Config homingConfig() {
-    Homing::Config c;
-    c.fastMmS = config::kHomeFastSpeed;
-    c.slowMmS = config::kHomeSlowSpeed;
-    c.accelMmS2 = config::kHomeAccel;
-    c.maxSeekMm = config::kMaxTravelMm + 3.0f;
-    return c;
-}
-
 AlignSession::Config alignConfig() {
     AlignSession::Config c;
     c.limits = liftLimits();
     return c;
 }
 
-StepperDrive drive;
-Pcf8574 expander;
+ServoLedc actuator;
 TofSensor tof;
 KnobEncoder encoder;
 PresenceDetector presence(presenceConfig());
-Homing homing(homingConfig());
 AlignSession align(alignConfig());
+MotionPlanner motion;
 PressDetector button;
 Preferences prefs;
 
-Sys sys = Sys::Homing;
 Mode mode = Mode::Auto;
 LiftSettings settings;
-const char* faultReason = "";
-bool driverOn = false;
-uint32_t driverOnMs = 0;
 uint32_t lastMoveMs = 0;
+// At power-up the knob may still be where it was left, a full stroke away. The
+// PQ12 crosses that in under 2 s, so keep the first signal on longer than usual.
+constexpr uint32_t kBootHoldMs = 2500;
+uint32_t releaseAfterMs = kBootHoldMs;
 int distanceMm = TofSensor::kNoTarget;
 constexpr uint32_t kTofRetryMs = 5000;
 uint32_t lastTofRetryMs = 0;
@@ -103,55 +95,13 @@ portMUX_TYPE sharedLock = portMUX_INITIALIZER_UNLOCKED;
 Shared shared{};
 std::atomic<int> sharedDetents{0};
 
-// ---------------------------------------------------------------------------
-// Hardware helpers
-// ---------------------------------------------------------------------------
-
-void setDriver(bool on, uint32_t now) {
-    if (on == driverOn) return;
-    expander.setBit(config::kExpEnableBit, !on);  // EN is active low
-    driverOn = on;
-    driverOnMs = now;
-}
-
-// One missed I2C read keeps the last value; three in a row count as tripped (fail safe).
-constexpr int kMaxSensorReadFailures = 3;
-bool lastHome = true;
-int sensorReadFailures = 0;
-
-bool homeTripped() {
-    bool high = true;
-    if (expander.readBit(config::kExpHomeBit, high)) {
-        sensorReadFailures = 0;
-        lastHome = high == config::kHomeTrippedHigh;
-    } else if (++sensorReadFailures >= kMaxSensorReadFailures) {
-        lastHome = true;
-    }
-    return lastHome;
+float extensionToUs(float mm) {
+    return config::kPulseRetractedUs + (config::kPulseExtendedUs - config::kPulseRetractedUs) * (mm / config::kStrokeMm);
 }
 
 void saveSettings() {
     prefs.putFloat("flushMm", settings.flushMm);
     prefs.putFloat("heightMm", settings.heightMm);
-}
-
-void startHoming(uint32_t now, bool homeHit) {
-    align.cancel();
-    if (!driverOn) {
-        setDriver(true, now);
-        delay(20);  // let the driver energise before the first step
-    }
-    homing.start(drive, homeHit);
-    sys = Sys::Homing;
-    Serial.println("Homing...");
-}
-
-void fault(uint32_t now, const char* why) {
-    drive.stop();
-    setDriver(false, now);
-    sys = Sys::Fault;
-    faultReason = why;
-    Serial.printf("FAULT: %s. Fix it, then type 'home'.\n", why);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,23 +117,13 @@ const char* modeName() {
     return "?";
 }
 
-const char* sysName() {
-    switch (sys) {
-        case Sys::Homing: return "homing";
-        case Sys::Run: return "running";
-        case Sys::Fault: return "FAULT";
-    }
-    return "?";
-}
-
 void printHelp() {
     Serial.println(
         "Commands:\n"
         "  status            show sensor, presence, position and settings\n"
         "  up | down | auto  force the knob up/down, or back to hand detection\n"
-        "  home              find the home sensor again (also clears a fault)\n"
         "  log               toggle printing the distance 5x per second\n"
-        "  flush <mm>        set the flush position (mm above the home trip point) and save\n"
+        "  flush <mm>        set the actuator extension at flush and save\n"
         "  height <mm>       set how far it rises above flush and save\n"
         "  align             interactive alignment (same as holding the button 2 s):\n"
         "    + | - | +N | -N   nudge the current value (flush: 0.05 mm, height: 0.1 mm steps)\n"
@@ -192,13 +132,11 @@ void printHelp() {
 }
 
 void printStatus() {
-    Serial.printf("state=%s mode=%s sensor=%s distance=%d mm want=%s blocked=%s\n", sysName(), modeName(),
-                  tof.ok() ? "ok" : "MISSING", distanceMm, presence.wantRaised() ? "up" : "down",
-                  presence.blocked() ? "yes" : "no");
-    Serial.printf("position=%.2f mm (flush=%.2f raised=%.2f) motor=%s home sensor=%s expander=%s\n",
-                  drive.positionMm(), settings.flushMm, settings.raisedMm(), driverOn ? "on" : "off",
-                  homeTripped() ? "tripped" : "clear", expander.ok() ? "ok" : "MISSING");
-    if (sys == Sys::Fault) Serial.printf("fault: %s\n", faultReason);
+    Serial.printf("mode=%s sensor=%s distance=%d mm want=%s blocked=%s\n", modeName(), tof.ok() ? "ok" : "MISSING",
+                  distanceMm, presence.wantRaised() ? "up" : "down", presence.blocked() ? "yes" : "no");
+    Serial.printf("commanded=%.2f mm (%.0f us) flush=%.2f raised=%.2f signal=%s\n", motion.position(),
+                  extensionToUs(motion.position()), settings.flushMm, settings.raisedMm(),
+                  actuator.active() ? "on" : "released");
     if (align.active()) {
         Serial.printf("aligning %s: flush=%.2f height=%.2f\n",
                       align.phase() == AlignSession::Phase::Flush ? "flush" : "height", align.settings().flushMm,
@@ -207,10 +145,6 @@ void printStatus() {
 }
 
 void startAlign(uint32_t now) {
-    if (sys != Sys::Run) {
-        Serial.println("Can't align until homing has finished.");
-        return;
-    }
     align.begin(now, settings);
     Serial.println("Aligning FLUSH: turn the ring (or +/-), press the button (or 'next') for HEIGHT.");
 }
@@ -226,7 +160,6 @@ void handleCommand(char* line, uint32_t now) {
         Serial.printf("distance log %s\n", logDistance ? "on" : "off");
         return;
     }
-    if (!strcmp(line, "home")) return startHoming(now, homeTripped());
     if (!strcmp(line, "align")) return startAlign(now);
     if (!strcmp(line, "flush") || !strcmp(line, "height")) {
         if (!arg) return printHelp();
@@ -279,7 +212,27 @@ void pollSerial(uint32_t now) {
 // Control loop
 // ---------------------------------------------------------------------------
 
-void runStep(uint32_t now, bool homeHit, int detents, PressDetector::Event press) {
+void publish() {
+    Shared s{};
+    s.level = (motion.position() - settings.flushMm) / settings.heightMm;
+#if RK_ENABLE_DISPLAY
+    s.screen = ui::Screen::Dial;
+    if (align.phase() == AlignSession::Phase::Flush) s.screen = ui::Screen::AlignFlush;
+    else if (align.phase() == AlignSession::Phase::Height) s.screen = ui::Screen::AlignHeight;
+#endif
+    if (align.active()) {
+        s.level = 1.0f;
+        s.valueMm = align.phase() == AlignSession::Phase::Flush ? align.settings().flushMm : align.settings().heightMm;
+    }
+    portENTER_CRITICAL(&sharedLock);
+    shared = s;
+    portEXIT_CRITICAL(&sharedLock);
+}
+
+void controlStep(uint32_t now, float dt) {
+    pollSerial(now);
+
+    const int detents = encoder.takeDetents();
     if (detents) {
         if (align.active()) align.adjust(now, detents, AlignSession::Source::Ring);
         else {
@@ -287,6 +240,8 @@ void runStep(uint32_t now, bool homeHit, int detents, PressDetector::Event press
             sharedDetents.fetch_add(detents);
         }
     }
+
+    const auto press = button.update(now, digitalRead(config::kButtonPin) == LOW);
     if (press == PressDetector::Event::Long) {
         if (align.active()) {
             align.cancel();
@@ -296,6 +251,20 @@ void runStep(uint32_t now, bool homeHit, int detents, PressDetector::Event press
         }
     } else if (press == PressDetector::Event::Short && align.active()) {
         align.next(now);
+    }
+
+    int mm;
+    if (tof.poll(mm)) distanceMm = mm;
+    else if (!tof.ok()) distanceMm = TofSensor::kNoTarget;
+    presence.update(now, distanceMm);
+    if (!tof.ok() && motion.atTarget() && now - lastTofRetryMs >= kTofRetryMs) {
+        lastTofRetryMs = now;  // init blocks a few ms, so only retry while parked
+        if (tof.begin()) Serial.println("VL53L1X back online");
+    }
+    if (logDistance && now - lastLogMs >= 200) {
+        lastLogMs = now;
+        Serial.printf("distance %d mm  want=%s  commanded %.2f mm\n", distanceMm,
+                      presence.wantRaised() ? "up" : "down", motion.position());
     }
 
     align.update(now);
@@ -312,101 +281,27 @@ void runStep(uint32_t now, bool homeHit, int detents, PressDetector::Event press
     else if (mode == Mode::ForceDown) target = settings.flushMm;
     else target = presence.wantRaised() ? settings.raisedMm() : settings.flushMm;
 
-    const float pos = drive.positionMm();
-    // The sensor only trips below flush. Seeing it up here means steps were lost
-    // (something blocked the knob), so find home again rather than trust the count.
-    if (homeHit && pos > 0.5f) {
-        drive.stop();
-        Serial.println("Home sensor tripped unexpectedly: re-homing.");
-        startHoming(now, homeHit);
-        return;
-    }
-
-    const bool needsMove = drive.moving() || std::fabs(target - pos) > 0.5f / config::kStepsPerMm;
-    if (needsMove) {
-        if (!driverOn) {
-            setDriver(true, now);  // let the driver energise before the first step
-            return;
-        }
-        if (now - driverOnMs < 20) return;
-        const bool rising = target > pos;
-        drive.track(target, rising ? config::kRaiseSpeed : config::kLowerSpeed,
-                    rising ? config::kRaiseAccel : config::kLowerAccel);
+    if (target != motion.target()) motion.setTarget(target, target > motion.position() ? kRaiseLimits : kLowerLimits);
+    if (!motion.atTarget()) {
+        motion.update(dt);
+        actuator.writeMicroseconds(extensionToUs(motion.position()));
         lastMoveMs = now;
-    } else if (driverOn && now - lastMoveMs >= config::kDisableAfterMs) {
-        setDriver(false, now);  // parked: the lead screw holds the knob, the motor goes silent
-    }
-}
-
-void publish() {
-    Shared s{};
-    const float pos = drive.positionMm();
-    s.level = sys == Sys::Run ? (pos - settings.flushMm) / settings.heightMm : 0.0f;
-#if RK_ENABLE_DISPLAY
-    s.screen = ui::Screen::Dial;
-    if (sys == Sys::Homing) s.screen = ui::Screen::Homing;
-    else if (sys == Sys::Fault) s.screen = ui::Screen::Fault;
-    else if (align.phase() == AlignSession::Phase::Flush) s.screen = ui::Screen::AlignFlush;
-    else if (align.phase() == AlignSession::Phase::Height) s.screen = ui::Screen::AlignHeight;
-#endif
-    if (align.active()) {
-        s.level = 1.0f;
-        s.valueMm = align.phase() == AlignSession::Phase::Flush ? align.settings().flushMm : align.settings().heightMm;
-    }
-    if (sys != Sys::Run) s.level = 1.0f;  // show the homing / fault message
-    portENTER_CRITICAL(&sharedLock);
-    shared = s;
-    portEXIT_CRITICAL(&sharedLock);
-}
-
-void controlStep(uint32_t now) {
-    pollSerial(now);
-
-    const bool homeHit = homeTripped();
-    const int detents = encoder.takeDetents();
-    const auto press = button.update(now, digitalRead(config::kButtonPin) == LOW);
-
-    int mm;
-    if (tof.poll(mm)) distanceMm = mm;
-    else if (!tof.ok()) distanceMm = TofSensor::kNoTarget;
-    presence.update(now, distanceMm);
-    if (!tof.ok() && !drive.moving() && now - lastTofRetryMs >= kTofRetryMs) {
-        lastTofRetryMs = now;  // init blocks a few ms, so only retry while parked
-        if (tof.begin()) Serial.println("VL53L1X back online");
-    }
-    if (logDistance && now - lastLogMs >= 200) {
-        lastLogMs = now;
-        Serial.printf("distance %d mm  want=%s  position %.2f mm\n", distanceMm,
-                      presence.wantRaised() ? "up" : "down", drive.positionMm());
-    }
-
-    switch (sys) {
-        case Sys::Homing:
-            homing.update(drive, homeHit);
-            if (homing.state() == Homing::State::Done) {
-                sys = Sys::Run;
-                lastMoveMs = now;
-                Serial.printf("Homed. Flush at %.2f mm, raised at %.2f mm.\n", settings.flushMm, settings.raisedMm());
-            } else if (homing.state() == Homing::State::Failed) {
-                fault(now, homing.error());
-            }
-            break;
-        case Sys::Run:
-            if (sensorReadFailures >= kMaxSensorReadFailures) fault(now, "PCF8574 expander not answering");
-            else runStep(now, homeHit, detents, press);
-            break;
-        case Sys::Fault:
-            if (press == PressDetector::Event::Long) startHoming(now, homeHit);
-            break;
+        releaseAfterMs = config::kReleaseAfterMs;
+    } else if (config::kReleaseWhenParked && actuator.active() && now - lastMoveMs >= releaseAfterMs) {
+        actuator.release();  // parked: the actuator holds on its own and goes quiet
     }
     publish();
 }
 
 void controlTask(void*) {
     TickType_t wake = xTaskGetTickCount();
+    uint32_t last = millis();
+    lastMoveMs = last;
     for (;;) {
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(config::kControlPeriodMs));
-        controlStep(millis());
+        const uint32_t now = millis();
+        controlStep(now, (now - last) / 1000.0f);
+        last = now;
     }
 }
 
@@ -424,26 +319,26 @@ void setup() {
 
     pinMode(config::kButtonPin, INPUT_PULLUP);
     Wire.begin(config::kI2cSdaPin, config::kI2cSclPin, config::kI2cHz);
-    const bool expanderOk = expander.begin(config::kExpanderAddr);  // also keeps EN off
-    if (!expanderOk) Serial.println("PCF8574 not found at 0x20: check SDA=GPIO39, SCL=GPIO44, 3.3 V and GND.");
-    if (!drive.begin(config::kStepPin, config::kDirPin, config::kStepsPerMm, config::kDirHighRaises,
-                     config::kJerkRampMm)) {
-        Serial.println("Stepper setup FAILED");
-    }
+
+    // Command flush straight away: the PQ12 knows its own position, so the knob
+    // only moves if it was left somewhere else when the power went off.
+    if (!actuator.begin(config::kActuatorPin)) Serial.println("Actuator PWM setup FAILED");
+    motion.reset(settings.flushMm);
+    actuator.writeMicroseconds(extensionToUs(settings.flushMm));
+
     if (!encoder.begin(config::kEncoderPinA, config::kEncoderPinB)) Serial.println("Encoder setup FAILED");
-    if (!tof.begin()) Serial.println("VL53L1X not found: turning the ring still raises the knob.");
+    if (!tof.begin()) {
+        Serial.println("VL53L1X not found: check SDA=GPIO39, SCL=GPIO44, 3.3 V and GND. Turning the ring still raises the knob.");
+    }
 
 #if RK_ENABLE_DISPLAY
     if (display::begin()) ui::begin();
     else Serial.println("Display setup FAILED");
 #endif
 
-    const uint32_t now = millis();
-    if (expanderOk) startHoming(now, homeTripped());
-    else fault(now, "PCF8574 expander not answering");
-
     xTaskCreatePinnedToCore(controlTask, "control", 6144, nullptr, 5, nullptr, 0);
-    Serial.println("Type 'help' for commands.");
+    Serial.printf("Ready (flush=%.2f mm, raised=%.2f mm). Type 'help' for commands.\n", settings.flushMm,
+                  settings.raisedMm());
 }
 
 void loop() {

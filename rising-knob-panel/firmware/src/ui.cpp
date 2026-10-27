@@ -86,7 +86,6 @@ void show(Screen screen, float valueMm) {
     shownMm = valueMm;
 
     setVisible(arc, screen == Screen::Dial);
-    setVisible(valueLabel, screen == Screen::Dial || alignScreen);
     setVisible(hint, screen != Screen::Dial);
     switch (screen) {
         case Screen::Dial:
@@ -103,14 +102,6 @@ void show(Screen screen, float valueMm) {
                                                                  : "turn the ring to set height\npress to save");
             break;
         }
-        case Screen::Homing:
-            lv_label_set_text(caption, "HOMING");
-            lv_label_set_text(hint, "");
-            break;
-        case Screen::Fault:
-            lv_label_set_text(caption, "CHECK MECHANISM");
-            lv_label_set_text(hint, "see the USB console");
-            break;
     }
 }
 

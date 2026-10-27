@@ -1,11 +1,10 @@
 #pragma once
 
-// Screens: a placeholder dial (the ring turns a 0-100 value), the alignment
-// screens, and status messages. Swap the dial for your real UI; it only needs
-// LVGL and `addDetents()`.
+// Screens: a placeholder dial (the ring turns a 0-100 value) and the alignment
+// screens. Swap the dial for your real UI; it only needs LVGL and `addDetents()`.
 namespace ui {
 
-enum class Screen { Dial, AlignFlush, AlignHeight, Homing, Fault };
+enum class Screen { Dial, AlignFlush, AlignHeight };
 
 void begin();
 void addDetents(int detents);
